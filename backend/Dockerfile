@@ -21,6 +21,9 @@ COPY configs /configs
 COPY backend/requirements.txt .
 RUN uv pip install --system -r requirements.txt
 
+# Install Chromium for the scraper's SPA (JS-rendered docs) fallback
+RUN playwright install --with-deps chromium
+
 # Copy application code
 COPY backend/app.py .
 
