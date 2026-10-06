@@ -39,7 +39,13 @@ class DocToSkillConverter:
         start_urls = config.get('start_urls', [self.base_url])
         self.pending_urls = deque(start_urls)
         self.pages = []
-        
+
+        # SPA fallback: flips to True once empty-content pages are detected,
+        # then every subsequent fetch uses a real browser instead of requests
+        self.use_browser = False
+        self._browser = None
+        self._browser_page = None
+
         # Session with proper headers for documentation sites
         self.session = requests.Session()
         self.session.headers.update({
@@ -49,7 +55,7 @@ class DocToSkillConverter:
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
         })
-        
+
         # Create directories
         os.makedirs(f"{self.data_dir}/pages", exist_ok=True)
         os.makedirs(f"{self.skill_dir}/references", exist_ok=True)
@@ -141,7 +147,42 @@ class DocToSkillConverter:
                 page['links'].append(href)
         
         return page
-    
+
+    def is_thin_content(self, page, soup):
+        """Heuristic: page looks like an unrendered SPA shell.
+
+        Triggers when the main content area yielded nothing usable
+        (no text, no headings, no links) even though the raw HTML
+        wasn't empty - the classic signature of client-side rendering
+        that requests/BeautifulSoup can't execute.
+        """
+        if len(soup.get_text(strip=True)) < 50:
+            return False  # genuinely empty/error page, not a JS issue
+
+        return (
+            len(page['content']) < 30
+            and not page['headings']
+            and not page['links']
+        )
+
+    def fetch_with_browser(self, url):
+        """Fetch a page with a real browser for JS-rendered (SPA) docs"""
+        from playwright.sync_api import sync_playwright
+
+        if self._browser is None:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch()
+            self._browser_page = self._browser.new_page()
+
+        self._browser_page.goto(url, wait_until='networkidle', timeout=30000)
+        return self._browser_page.content()
+
+    def close_browser(self):
+        if self._browser is not None:
+            self._browser.close()
+            self._playwright.stop()
+            self._browser = None
+
     def detect_language(self, elem, code):
         """Detect programming language from code block"""
         # Check class attribute
@@ -214,36 +255,46 @@ class DocToSkillConverter:
         for attempt in range(max_retries):
             try:
                 print(f"  {url}" if attempt == 0 else f"  Retry {attempt + 1}: {url}")
-                
-                # Use session for connection pooling
-                response = self.session.get(url, timeout=30)
-                response.raise_for_status()
-                
-                soup = BeautifulSoup(response.content, 'html.parser')
+
+                if self.use_browser:
+                    html = self.fetch_with_browser(url)
+                else:
+                    response = self.session.get(url, timeout=30)
+                    response.raise_for_status()
+                    html = response.content
+
+                soup = BeautifulSoup(html, 'html.parser')
                 page = self.extract_content(soup, url)
-                
+
+                if not self.use_browser and self.is_thin_content(page, soup):
+                    print(f"  ⚠ Detected JS-rendered (SPA) docs, switching to browser rendering")
+                    self.use_browser = True
+                    html = self.fetch_with_browser(url)
+                    soup = BeautifulSoup(html, 'html.parser')
+                    page = self.extract_content(soup, url)
+
                 self.save_page(page)
                 self.pages.append(page)
-                
+
                 # Add new URLs
                 for link in page['links']:
                     if link not in self.visited_urls and link not in self.pending_urls:
                         self.pending_urls.append(link)
-                
+
                 # Rate limiting - increased for safety
                 time.sleep(self.config.get('rate_limit', 1.0))
                 return  # Success, exit retry loop
-                
+
             except requests.exceptions.RequestException as e:
                 if attempt == max_retries - 1:
                     print(f"  ✗ Failed after {max_retries} attempts: {e}")
                     return
-                
+
                 # Exponential backoff
                 wait_time = (2 ** attempt) + 1
                 print(f"  ⚠ Attempt {attempt + 1} failed: {e}, retrying in {wait_time}s...")
                 time.sleep(wait_time)
-                
+
             except Exception as e:
                 print(f"  ✗ Unexpected error: {e}")
                 return
@@ -258,18 +309,21 @@ class DocToSkillConverter:
         
         max_pages = self.config.get('max_pages', 500)
         
-        while self.pending_urls and len(self.visited_urls) < max_pages:
-            url = self.pending_urls.popleft()
-            
-            if url in self.visited_urls:
-                continue
-            
-            self.visited_urls.add(url)
-            self.scrape_page(url)
-            
-            if len(self.visited_urls) % 10 == 0:
-                print(f"  [{len(self.visited_urls)} pages]")
-        
+        try:
+            while self.pending_urls and len(self.visited_urls) < max_pages:
+                url = self.pending_urls.popleft()
+
+                if url in self.visited_urls:
+                    continue
+
+                self.visited_urls.add(url)
+                self.scrape_page(url)
+
+                if len(self.visited_urls) % 10 == 0:
+                    print(f"  [{len(self.visited_urls)} pages]")
+        finally:
+            self.close_browser()
+
         print(f"\n✅ Scraped {len(self.visited_urls)} pages")
         self.save_summary()
     
