@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import subprocess
+import sys
 import uuid
 import json
 import os
@@ -98,7 +99,7 @@ def run_scraper(job_id: str, url: str, name: str, description: Optional[str], en
         jobs[job_id]["progress"] = 10
         
         # Build command
-        cmd = ["python3", "../doc_scraper.py"]
+        cmd = [sys.executable, "doc_scraper.py"]
         
         if config:
             # Save config temporarily
@@ -159,7 +160,7 @@ def run_scraper(job_id: str, url: str, name: str, description: Optional[str], en
         
         # Package the skill
         package_result = subprocess.run(
-            ["python3", "../package_skill.py", f"../output/{name}/"],
+            [sys.executable, "package_skill.py", f"output/{name}/"],
             capture_output=True,
             text=True,
             cwd="..",
